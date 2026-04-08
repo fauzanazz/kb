@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, unlink } from 'fs/promises';
 import { join, relative } from 'path';
 import { existsSync } from 'fs';
 import chalk from 'chalk';
@@ -6,6 +6,34 @@ import { findKBRoot, loadConfig, loadState, saveState } from '../config';
 import { initLLM, chatJSON, chat } from '../llm';
 import { contentHash, slugify, getAllFiles, truncate } from '../utils';
 import type { KBState, WikiArticle, CompileResult } from '../types';
+
+const LOCK_FILE = '.kb/compile.lock';
+const LOCK_STALE_MS = 30 * 60 * 1000; // 30 min — consider lock stale after this
+
+async function acquireLock(kbRoot: string): Promise<boolean> {
+  const lockPath = join(kbRoot, LOCK_FILE);
+  if (existsSync(lockPath)) {
+    try {
+      const lockData = JSON.parse(await readFile(lockPath, 'utf-8'));
+      const age = Date.now() - lockData.timestamp;
+      if (age < LOCK_STALE_MS) {
+        console.log(chalk.red(`✗ Another compile is running (PID ${lockData.pid}, started ${Math.round(age / 1000)}s ago).`));
+        console.log(chalk.dim(`  Remove ${lockPath} manually if the process is dead.`));
+        return false;
+      }
+      console.log(chalk.yellow(`⚠ Stale lock found (${Math.round(age / 60000)}min old). Overriding.`));
+    } catch {
+      // Corrupt lock file — override
+    }
+  }
+  await writeFile(lockPath, JSON.stringify({ pid: process.pid, timestamp: Date.now() }));
+  return true;
+}
+
+async function releaseLock(kbRoot: string): Promise<void> {
+  const lockPath = join(kbRoot, LOCK_FILE);
+  try { await unlink(lockPath); } catch {}
+}
 
 const CHUNK_THRESHOLD = 30000; // If raw doc > 30K chars, chunk it
 
@@ -41,7 +69,7 @@ interface CompileOutput {
   }>;
 }
 
-export async function compileCommand(options: { full?: boolean }) {
+export async function compileCommand(options: { full?: boolean; only?: string }) {
   const kbRoot = findKBRoot();
   if (!kbRoot) {
     console.log(chalk.red('✗ Not in a knowledge base. Run `kb init <name>` first.'));
@@ -52,6 +80,17 @@ export async function compileCommand(options: { full?: boolean }) {
   const state: KBState = await loadState(kbRoot);
   initLLM(config);
 
+  // Acquire lock
+  if (!await acquireLock(kbRoot)) return;
+
+  try {
+    await doCompile(kbRoot, config, state, options);
+  } finally {
+    await releaseLock(kbRoot);
+  }
+}
+
+async function doCompile(kbRoot: string, config: any, state: KBState, options: { full?: boolean; only?: string }) {
   // Find raw documents to process
   const rawFiles = await getAllFiles(join(kbRoot, config.paths.raw));
   
@@ -60,13 +99,22 @@ export async function compileCommand(options: { full?: boolean }) {
     return;
   }
 
+  // Filter by --only glob if provided
+  const onlyPattern = options.only ? new RegExp(
+    options.only.replace(/\*/g, '.*').replace(/\?/g, '.'), 'i'
+  ) : null;
+
   // Determine which files need processing
   let toProcess: Array<{ path: string; content: string; relPath: string }> = [];
   
   for (const filePath of rawFiles) {
+    const relPath = relative(kbRoot, filePath);
+
+    // Skip if --only is set and path doesn't match
+    if (onlyPattern && !onlyPattern.test(relPath)) continue;
+
     const content = await readFile(filePath, 'utf-8');
     const hash = contentHash(content);
-    const relPath = relative(kbRoot, filePath);
     
     // Find the raw doc entry by path
     const docEntry = Object.values(state.rawDocuments).find(d => d.path === relPath);
@@ -148,7 +196,7 @@ export async function compileCommand(options: { full?: boolean }) {
           ? [...new Set([...existingArticle.sources, doc.relPath])]
           : [doc.relPath];
         
-        const fullContent = `---\ntitle: "${article.title}"\ncategory: ${categoryToUse}\nsummary: "${article.summary.replace(/"/g, '\\"')}"\nsources:\n${sources.map(s => `  - ${s}`).join('\n')}\nupdated: ${new Date().toISOString()}\n---\n\n# ${article.title}\n\n> ${article.summary}\n\n${articleContent}\n\n---\n*Related: ${article.relatedTopics.map(t => `[[${t}]]`).join(', ')}*\n`;
+        const fullContent = `---\ntitle: "${article.title}"\ncategory: ${categoryToUse}\nsummary: "${article.summary.replace(/"/g, '\\"')}"\nsources:\n${sources.map(s => `  - ${s}`).join('\n')}\nupdated: ${new Date().toISOString()}\n---\n\n# ${article.title}\n\n> ${article.summary}\n\n${articleContent}\n\n---\n*Related: ${(article.relatedTopics ?? []).map(t => `[[${t}]]`).join(', ')}*\n`;
         
         const isNew = !existsSync(articlePath) && !existingArticle;
         await writeFile(articlePath, fullContent);

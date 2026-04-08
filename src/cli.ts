@@ -36,6 +36,7 @@ program
   .command('compile')
   .description('Compile raw documents into wiki articles')
   .option('-f, --full', 'Full recompile (ignore cache)', false)
+  .option('-o, --only <pattern>', 'Only compile files matching glob pattern (e.g. "*rag*", "*ai-*")')
   .action(compileCommand);
 
 program
